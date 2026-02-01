@@ -13,10 +13,14 @@ import textwrap
 from typing import Any, Dict, Tuple
 import re
 
-def extract_columns_from_code(code: str):
-    """
-    Find column names used like df["col"] or df['col']
-    """
+def normalize_column(col: str, columns: list[str]) -> str | None:
+    matches = [c for c in columns if c.lower() == col.lower()]
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
+def extract_columns_from_code(code: str)-> set[str]:
     pattern = r"df\[['\"]([^'\"]+)['\"]\]"
     return set(re.findall(pattern, code))
 
@@ -42,13 +46,28 @@ def run_user_code(code: str, env: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
     df = env.get("df")
     if df is not None:
         used_cols = extract_columns_from_code(code)
-        invalid_cols = used_cols - set(df.columns)
+
+        resolved_cols = {}
+        invalid_cols = set()
+
+        for col in used_cols:
+            resolved = normalize_column(col, list(df.columns))
+            if resolved is None:
+                invalid_cols.add(col)
+            else:
+                resolved_cols[col] = resolved
 
         if invalid_cols:
             raise ValueError(
-                f"Invalid column(s) referenced: {invalid_cols}. "
+                f"Invalid column(s) referenced: {sorted(invalid_cols)}. "
                 f"Available columns are: {list(df.columns)}"
             )
+        
+        for original, resolved in resolved_cols.items():
+            if original != resolved:
+                code = code.replace(f"df['{original}']", f"df['{resolved}']")
+                code = code.replace(f'df["{original}"]', f'df["{resolved}"]')
+
 
     # ---- Safe execution ----
     local_env: Dict[str, Any] = {}

@@ -25,12 +25,27 @@ model = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 if not os.environ.get("OPENAI_API_KEY"):
     st.warning("Set OPENAI_API_KEY in your environment or .env")
 
+# -------------------------------
+# Session state
+# -------------------------------
 if "memory" not in st.session_state:
     st.session_state.memory = ChatMemory()
 
 if "df" not in st.session_state:
     st.session_state.df = None
 
+if "last_column" not in st.session_state:
+    st.session_state.last_column = None
+
+
+def find_candidate_columns(user_text: str, columns: list[str]) -> list[str]:
+    text = user_text.lower()
+    return [c for c in columns if c.lower() in text]
+
+
+# -------------------------------
+# Sidebar: Data upload
+# -------------------------------
 with st.sidebar:
     st.header("Data")
     up = st.file_uploader("Upload CSV or Excel", type=["csv", "xlsx"])
@@ -41,7 +56,9 @@ with st.sidebar:
             st.session_state.df = pd.read_excel(up)
 
     if st.session_state.df is not None:
-        st.success(f"Loaded: {st.session_state.df.shape[0]} rows × {st.session_state.df.shape[1]} cols")
+        st.success(
+            f"Loaded: {st.session_state.df.shape[0]} rows × {st.session_state.df.shape[1]} cols"
+        )
         st.caption("Preview")
         st.dataframe(st.session_state.df.head(20), use_container_width=True)
 
@@ -57,53 +74,99 @@ if df is None:
     st.info("Upload a dataset to begin.")
     st.stop()
 
+# -------------------------------
 # Render chat history
+# -------------------------------
 for m in st.session_state.memory.messages:
     with st.chat_message(m["role"]):
         st.markdown(m["content"])
 
+# -------------------------------
+# Chat input
+# -------------------------------
 user_q = st.chat_input("Ask a question about your data…")
 if user_q:
     st.session_state.memory.add_user(user_q)
     with st.chat_message("user"):
         st.markdown(user_q)
 
-    # Route
-    route = route_question(user_q, model=model)
-    tool = route.get("tool", "none")
+
+    route = route_question(
+        user_q,
+        model=model,
+        has_df=True
+    )
+    tool = route.get("tool", "eda")
 
     with st.chat_message("assistant"):
         st.caption(f"Tool: **{tool}** · Reason: {route.get('reason','')}")
-        st.write("Plan:", route.get("plan", []))
 
-        # Tool behaviors
+        # ---------------------------
+        # PROFILE
+        # ---------------------------
         if tool == "profile":
             prof = profile_df(df)
             st.write(prof)
-            answer = "I profiled your dataset above. Tell me what outcome/metric you care about, and I’ll dig in."
+            answer = "I profiled your dataset above. Tell me what outcome or metric you want to analyze."
 
+        # ---------------------------
+        # EDA / PLOT / STATS
+        # ---------------------------
         elif tool in {"eda", "plot", "stats"}:
-            # Ask LLM to write python code using df
+
+            columns = list(df.columns)
+            candidates = find_candidate_columns(user_q, columns)
+
+            if len(candidates) == 1:
+                inferred_column = candidates[0]
+                st.session_state.last_column = inferred_column
+            elif len(candidates) > 1:
+                msg = (
+                    f"I found multiple matching columns: {candidates}. "
+                    f"Which one should I use?"
+                )
+                st.markdown(msg)
+                st.session_state.memory.add_assistant(msg)
+                st.stop()
+            else:
+                inferred_column = st.session_state.last_column
+
+            column_hint = (
+                f"The user is referring to column '{inferred_column}'."
+                if inferred_column else ""
+            )
+
+
             code_prompt = f"""
 Write Python code to answer the user's question using pandas/numpy/matplotlib.
-Rules:
-- You already have df (pandas DataFrame), pd, np, plt available.
+
+STRICT SCHEMA RULES:
+- You MUST use column names EXACTLY as they appear in df.columns.
+- DO NOT invent, rename, infer, or assume column names.
+- Do NOT attempt fuzzy matching or semantic guessing of column names.
+- If the requested column does not exist, STOP and set:
+  result = "Column not found. Available columns are: {list(df.columns)}"
+
+EXECUTION RULES:
+- df, pd, np, plt are already available.
 - Do NOT import anything.
-- Put your final human-readable output in a variable named `result`.
-  - result can be a string, dict, pandas DataFrame, or a list of dicts.
-- If you create a plot, call plt.figure() and plot, but do not call plt.show().
+- If creating a plot, call plt.figure() and create the plot, but do NOT call plt.show().
+- Put the final output in a variable named `result`.
+
+Context:
+- Available columns: {list(df.columns)}
+- {column_hint}
 
 User question: {user_q}
-
-Context: df columns = {list(df.columns)}
 """
+
             py_messages = [
                 {"role": "system", "content": SYSTEM_ANALYST},
                 {"role": "user", "content": code_prompt},
             ]
             raw_code = generate_python(py_messages, model=model)
 
-            # Basic cleanup if model wraps with markdown fences
+            # Cleanup markdown fences
             code = raw_code.strip()
             if code.startswith("```"):
                 code = code.split("```", 2)[1]
@@ -113,37 +176,38 @@ Context: df columns = {list(df.columns)}
             st.subheader("Generated code")
             st.code(code, language="python")
 
-            # Execute safely-ish
+
             env = {"df": df, "pd": pd, "np": np, "plt": plt}
             try:
                 _, result = run_user_code(code, env=env)
 
-                # Render plot if created
                 fig = plt.gcf()
                 if fig and fig.axes:
                     st.pyplot(fig, clear_figure=True)
 
-                # Render result
                 if isinstance(result, pd.DataFrame):
                     st.dataframe(result, use_container_width=True)
-                    answer = "Here are the computed results in the table above."
+                    answer = "Here are the computed results."
                 elif isinstance(result, (dict, list)):
                     st.write(result)
-                    answer = "Here are the computed results above."
+                    answer = "Here are the computed results."
                 elif result is None:
-                    answer = "I ran the analysis, but the code didn’t set `result`. Want me to re-run with a cleaner output?"
+                    answer = "Analysis ran successfully, but no explicit result was returned."
                 else:
                     st.markdown(str(result))
                     answer = str(result)
 
             except Exception as e:
-                answer = f"Execution blocked/failed: {e}"
+                answer = f"Execution blocked: {e}"
 
+        # ---------------------------
+        # Fallback (non-data)
+        # ---------------------------
         else:
-            # fallback conversational
             msgs = [{"role": "system", "content": SYSTEM_ANALYST}] + st.session_state.memory.last(10)
             answer = chat_text(msgs, model=model)
             st.markdown(answer)
 
     st.session_state.memory.add_assistant(answer)
+
 
